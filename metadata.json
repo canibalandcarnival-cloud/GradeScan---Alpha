@@ -1,0 +1,6 @@
+{
+  "name": "GradeScan",
+  "description": "AI-powered photo color grading analyzer and Lightroom XMP preset generator for photographers and creators.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

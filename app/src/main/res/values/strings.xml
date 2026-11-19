@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">GradeScan</string>
+    <string name="studio_tagline">AI Color Grading &amp; XMP Studio</string>
+    <string name="hero_badge">GEMINI COLOR ENGINE</string>
+    <string name="hero_title">Reverse-engineer any film look.</string>
+    <string name="hero_subtitle">Sample exposure curves, 3-way split toning, and texture telemetry into a Lightroom-ready .xmp preset.</string>
+    <string name="action_upload_photo">Upload Reference Photo</string>
+    <string name="action_capture_photo">Capture Color Reference</string>
+    <string name="results_title">Grade Analysis</string>
+    <string name="export_xmp_button">Export Lightroom Preset (.xmp)</string>
+    <string name="mood_summary_label">MOOD SUMMARY</string>
+    <string name="histogram_title">LIVE COLOR HISTOGRAM</string>
+    <string name="analyzing_title">Analyzing Color Science…</string>
+    <string name="analyzing_subtitle">Extracting tonal curve, white balance &amp; 3-way wheels</string>
+    <string name="camera_permission_denied">Camera permission is needed to capture a color reference frame.</string>
+    <string name="retry_action">Retry Analysis</string>
+    <string name="new_photo_action">New Photo</string>
+</resources>
