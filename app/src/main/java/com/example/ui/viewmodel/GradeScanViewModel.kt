@@ -15,6 +15,8 @@ import com.example.util.XmpExporter
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -95,28 +97,47 @@ class GradeScanViewModel(
             try {
                 val context = getApplication<Application>()
                 decodedBitmap = withContext(Dispatchers.IO) {
-                    ImageProcessor.decodeScaledBitmap(context, uri, maxDimension = 1280)
-                }
-                computedHistogram = withContext(Dispatchers.Default) {
-                    ImageProcessor.computeHistogram(decodedBitmap)
+                    ImageProcessor.decodeScaledBitmap(context, uri, maxDimension = 1024)
                 }
 
                 _uiState.update {
                     it.copy(
                         analysisState = AnalysisUiState.Analyzing(
                             bitmap = decodedBitmap,
-                            histogram = computedHistogram
+                            histogram = null
                         )
                     )
                 }
 
-                val profile = analyzer.analyzeImage(decodedBitmap)
+                val profile = coroutineScope {
+                    val histogramDeferred = async(Dispatchers.Default) {
+                        ImageProcessor.computeHistogram(decodedBitmap).also { hist ->
+                            computedHistogram = hist
+                            _uiState.update { current ->
+                                val analyzing = current.analysisState as? AnalysisUiState.Analyzing
+                                if (analyzing != null) {
+                                    current.copy(analysisState = analyzing.copy(histogram = hist))
+                                } else {
+                                    current
+                                }
+                            }
+                        }
+                    }
+                    val profileDeferred = async {
+                        analyzer.analyzeImage(decodedBitmap)
+                    }
+                    histogramDeferred.await()
+                    profileDeferred.await()
+                }
+
+                val finalHistogram = computedHistogram
+                    ?: ImageProcessor.computeHistogram(decodedBitmap)
 
                 _uiState.update {
                     it.copy(
                         analysisState = AnalysisUiState.Success(
                             bitmap = decodedBitmap,
-                            histogram = computedHistogram,
+                            histogram = finalHistogram,
                             aiProfile = profile,
                             activeProfile = profile
                         )

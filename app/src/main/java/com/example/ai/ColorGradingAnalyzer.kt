@@ -13,16 +13,19 @@ import com.google.genai.gaos.models.errors.GaosClientException
 import com.google.genai.gaos.models.errors.GaosServerException
 import com.google.genai.gaos.models.interactions.CreateModelInteraction
 import com.google.genai.gaos.models.interactions.CreateModelInteractionResponseFormat
+import com.google.genai.gaos.models.interactions.GenerationConfig
 import com.google.genai.gaos.models.interactions.ImageContent
 import com.google.genai.gaos.models.interactions.ImageContentMimeType
 import com.google.genai.gaos.models.interactions.Interaction
 import com.google.genai.gaos.models.interactions.InteractionStatus
 import com.google.genai.gaos.models.interactions.InteractionsInput
+import com.google.genai.gaos.models.interactions.MediaResolution
 import com.google.genai.gaos.models.interactions.Model
 import com.google.genai.gaos.models.interactions.ResponseFormat
 import com.google.genai.gaos.models.interactions.TextContent
 import com.google.genai.gaos.models.interactions.TextResponseFormat
 import com.google.genai.gaos.models.interactions.TextResponseFormatMimeType
+import com.google.genai.gaos.models.interactions.ThinkingLevel
 import com.google.genai.gaos.models.operations.CreateInteractionRequestBody
 import com.google.genai.types.HttpOptions
 import kotlinx.coroutines.CancellationException
@@ -32,9 +35,12 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 private const val TAG = "ColorGradingAnalyzer"
+private const val ANALYSIS_MAX_DIMENSION = 512
+private const val ANALYSIS_JPEG_QUALITY = 78
 
 class ColorGradingAnalyzer(
     private val clientFactory: (String) -> Client = { apiKey ->
@@ -64,6 +70,7 @@ class ColorGradingAnalyzer(
     }
 
     suspend fun analyzeImage(bitmap: Bitmap): ColorGradingProfile {
+        val startedAtMs = System.currentTimeMillis()
         return try {
             withTimeout(60_000L) {
                 val base64Jpeg = withContext(Dispatchers.Default) {
@@ -71,7 +78,10 @@ class ColorGradingAnalyzer(
                 }
                 val requestModel = buildModelInteraction(base64Jpeg)
                 val modelId = requestModel.model().map { it.value() }.orElse("unknown")
-                Log.d(TAG, "Sending Interactions API request (model=$modelId, apiVersion=v1beta)")
+                Log.d(
+                    TAG,
+                    "Sending Interactions API request (model=$modelId, apiVersion=v1beta, payloadChars=${base64Jpeg.length})"
+                )
 
                 val response = withContext(Dispatchers.IO) {
                     client.interactions.create(
@@ -84,7 +94,9 @@ class ColorGradingAnalyzer(
                     )
                 }
                 val generatedJsonText = extractInteractionOutputText(interaction)
-                parseProfile(generatedJsonText)
+                parseProfile(generatedJsonText).also {
+                    Log.d(TAG, "Analysis completed in ${System.currentTimeMillis() - startedAtMs}ms")
+                }
             }
         } catch (e: TimeoutCancellationException) {
             Log.e(TAG, "Color grading analysis timed out after 60s", e)
@@ -168,28 +180,41 @@ class ColorGradingAnalyzer(
     }
 
     private fun encodeBitmapToBase64Jpeg(bitmap: Bitmap): String {
+        val largestSide = max(bitmap.width, bitmap.height)
+        val scaledBitmap = if (largestSide > ANALYSIS_MAX_DIMENSION) {
+            val scale = ANALYSIS_MAX_DIMENSION.toFloat() / largestSide.toFloat()
+            Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * scale).roundToInt().coerceAtLeast(1),
+                (bitmap.height * scale).roundToInt().coerceAtLeast(1),
+                true
+            )
+        } else {
+            bitmap
+        }
+
         val stream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 88, stream)
+        try {
+            scaledBitmap.compress(Bitmap.CompressFormat.JPEG, ANALYSIS_JPEG_QUALITY, stream)
+        } finally {
+            if (scaledBitmap !== bitmap) {
+                scaledBitmap.recycle()
+            }
+        }
         return Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
     }
 
     internal fun buildModelInteraction(base64Jpeg: String): CreateModelInteraction {
         val prompt = """
-            You are a master digital colorist and Adobe Lightroom preset engineer.
-            Carefully inspect this reference photograph's luminance distribution, black/white points,
-            color temperature, skin/midtone warmth, highlight/shadow split-toning, micro-contrast,
-            vignetting, and film grain.
-
-            Output an accurate set of Adobe Lightroom Classic / Mobile develop settings that replicate
-            this exact color grading look when applied as a preset to a neutral reference photo.
-            Keep values realistic and well-calibrated (e.g., avoid extreme clipping unless clearly stylized,
-            use lifted blacks / negative contrast for faded matte film looks, and precise 3-way hue angles
-            in degrees where 0=red, 35=amber/orange, 180=cyan, 210=teal/blue).
+            Analyze this photo's lighting, white balance, split-toning, contrast, and texture as an
+            Adobe Lightroom preset engineer. Return calibrated Lightroom Classic/Mobile values that
+            replicate the exact look (3-way hue angles in degrees: 0=red, 35=amber, 180=cyan, 210=teal).
         """.trimIndent()
 
         val imageContent = ImageContent.builder()
             .data(base64Jpeg)
             .mimeType(ImageContentMimeType.IMAGE_JPEG)
+            .resolution(MediaResolution.LOW)
             .build()
         val textContent = TextContent.builder()
             .text(prompt)
@@ -200,9 +225,14 @@ class ColorGradingAnalyzer(
             .schema(buildResponseSchemaMap())
             .build()
 
+        val generationConfig = GenerationConfig.builder()
+            .thinkingLevel(ThinkingLevel.LOW)
+            .build()
+
         return CreateModelInteraction.builder()
             .model(Model.GEMINI38_FLASH)
             .input(InteractionsInput.ofContent(listOf(imageContent, textContent)))
+            .generationConfig(generationConfig)
             .responseFormat(
                 CreateModelInteractionResponseFormat.of(
                     ResponseFormat.of(textResponseFormat)

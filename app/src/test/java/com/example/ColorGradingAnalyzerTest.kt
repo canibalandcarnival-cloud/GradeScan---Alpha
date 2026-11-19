@@ -180,9 +180,10 @@ class ColorGradingAnalyzerTest {
 
         assertTrue(capturedRequest.startsWith("POST /v1beta/interactions HTTP/1.1"))
         assertTrue(capturedRequest.contains("\"model\":\"gemini-3.8-flash\""))
+        assertTrue(capturedRequest.contains("\"resolution\":\"low\""))
+        assertTrue(capturedRequest.contains("\"thinking_level\":\"low\""))
         assertTrue(!capturedRequest.contains("models/"))
         assertTrue(!capturedRequest.contains("\"response_mime_type\""))
-        assertTrue(!capturedRequest.contains("\"generation_config\""))
         assertTrue(!capturedRequest.contains("\"store\""))
         assertTrue(capturedRequest.contains("\"response_format\":{"))
     }
