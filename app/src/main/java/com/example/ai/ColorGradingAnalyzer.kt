@@ -9,6 +9,7 @@ import com.google.firebase.ai.type.Schema
 import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import kotlin.math.roundToInt
@@ -131,6 +132,9 @@ class ColorGradingAnalyzer {
             val jsonText = response.text
                 ?: throw IllegalStateException("Gemini returned an empty response.")
             parseProfile(jsonText)
+        } catch (e: TimeoutCancellationException) {
+            Log.e(TAG, "Color grading analysis timed out after 60s", e)
+            throw e
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
