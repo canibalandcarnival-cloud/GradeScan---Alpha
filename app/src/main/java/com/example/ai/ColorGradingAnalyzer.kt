@@ -226,11 +226,11 @@ class ColorGradingAnalyzer(
             .build()
 
         val generationConfig = GenerationConfig.builder()
-            .thinkingLevel(ThinkingLevel.LOW)
+            .thinkingLevel(ThinkingLevel.MINIMAL)
             .build()
 
         return CreateModelInteraction.builder()
-            .model(Model.GEMINI38_FLASH)
+            .model(Model.GEMINI35_FLASH_LITE)
             .input(InteractionsInput.ofContent(listOf(imageContent, textContent)))
             .generationConfig(generationConfig)
             .responseFormat(

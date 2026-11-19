@@ -33,10 +33,10 @@ class ColorGradingAnalyzerTest {
     }
 
     @Test
-    fun `buildModelInteraction targets gemini-3_8-flash with multimodal image and JSON schema`() {
+    fun `buildModelInteraction targets gemini-3_5-flash-lite with multimodal image and JSON schema`() {
         val request = analyzer.buildModelInteraction("ZmFrZUJhc2U2NA==")
 
-        assertEquals(Model.GEMINI38_FLASH, request.model().orElse(null))
+        assertEquals(Model.GEMINI35_FLASH_LITE, request.model().orElse(null))
 
         val contents = request.input().orElseThrow().arrayOfContent().orElseThrow()
         assertEquals(2, contents.size)
@@ -179,9 +179,9 @@ class ColorGradingAnalyzerTest {
         client.close()
 
         assertTrue(capturedRequest.startsWith("POST /v1beta/interactions HTTP/1.1"))
-        assertTrue(capturedRequest.contains("\"model\":\"gemini-3.8-flash\""))
+        assertTrue(capturedRequest.contains("\"model\":\"gemini-3.5-flash-lite\""))
         assertTrue(capturedRequest.contains("\"resolution\":\"low\""))
-        assertTrue(capturedRequest.contains("\"thinking_level\":\"low\""))
+        assertTrue(capturedRequest.contains("\"thinking_level\":\"minimal\""))
         assertTrue(!capturedRequest.contains("models/"))
         assertTrue(!capturedRequest.contains("\"response_mime_type\""))
         assertTrue(!capturedRequest.contains("\"store\""))
