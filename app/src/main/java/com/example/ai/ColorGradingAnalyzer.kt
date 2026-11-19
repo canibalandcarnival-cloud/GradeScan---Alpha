@@ -1,112 +1,101 @@
 package com.example.ai
 
 import android.graphics.Bitmap
+import android.util.Base64
 import android.util.Log
+import com.example.BuildConfig
 import com.example.model.ColorGradingProfile
-import com.google.firebase.Firebase
-import com.google.firebase.ai.ai
-import com.google.firebase.ai.type.Schema
-import com.google.firebase.ai.type.content
-import com.google.firebase.ai.type.generationConfig
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 private const val TAG = "ColorGradingAnalyzer"
+private const val GEMINI_MODEL_ID = "gemini-2.5-flash"
+private const val GEMINI_ENDPOINT =
+    "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL_ID:generateContent"
 
-class ColorGradingAnalyzer {
-
-    private val colorGradingSchema = Schema.obj(
-        properties = mapOf(
-            "presetName" to Schema.string(
-                description = "Short, evocative 2 to 4 word Lightroom preset name matching the aesthetic, e.g. 'Warm Teal Cinema'"
-            ),
-            "moodSummary" to Schema.string(
-                description = "Concise mood summary label, e.g. 'Warm Teal & Orange Cinematic' or 'Moody Matte Nordic Film'"
-            ),
-            "moodNotes" to Schema.string(
-                description = "One-sentence colorist note explaining the contrast curve, white balance bias, and shadow/highlight split"
-            ),
-            "exposure" to Schema.double(
-                description = "Estimated Lightroom Exposure2012 adjustment in EV from -3.0 to +3.0"
-            ),
-            "contrast" to Schema.integer(
-                description = "Estimated Lightroom Contrast2012 from -100 to +100"
-            ),
-            "highlights" to Schema.integer(
-                description = "Estimated Lightroom Highlights2012 from -100 to +100"
-            ),
-            "shadows" to Schema.integer(
-                description = "Estimated Lightroom Shadows2012 from -100 to +100"
-            ),
-            "whites" to Schema.integer(
-                description = "Estimated Lightroom Whites2012 from -100 to +100"
-            ),
-            "blacks" to Schema.integer(
-                description = "Estimated Lightroom Blacks2012 from -100 to +100"
-            ),
-            "temperature" to Schema.integer(
-                description = "Estimated color Temperature in Kelvin from 2500 (cool) to 10000 (warm), neutral daylight is 5500"
-            ),
-            "tint" to Schema.integer(
-                description = "Estimated green-magenta Tint from -150 (green) to +150 (magenta)"
-            ),
-            "vibrance" to Schema.integer(
-                description = "Estimated Lightroom Vibrance from -100 to +100"
-            ),
-            "saturation" to Schema.integer(
-                description = "Estimated Lightroom Saturation from -100 to +100"
-            ),
-            "highlightsHue" to Schema.integer(
-                description = "3-Way Color Grading Highlights Hue angle in degrees from 0 to 360"
-            ),
-            "highlightsSaturation" to Schema.integer(
-                description = "3-Way Color Grading Highlights Saturation from 0 to 100"
-            ),
-            "midtonesHue" to Schema.integer(
-                description = "3-Way Color Grading Midtones Hue angle in degrees from 0 to 360"
-            ),
-            "midtonesSaturation" to Schema.integer(
-                description = "3-Way Color Grading Midtones Saturation from 0 to 100"
-            ),
-            "shadowsHue" to Schema.integer(
-                description = "3-Way Color Grading Shadows Hue angle in degrees from 0 to 360"
-            ),
-            "shadowsSaturation" to Schema.integer(
-                description = "3-Way Color Grading Shadows Saturation from 0 to 100"
-            ),
-            "texture" to Schema.integer(
-                description = "Estimated Lightroom Texture from -100 to +100"
-            ),
-            "clarity" to Schema.integer(
-                description = "Estimated Lightroom Clarity2012 from -100 to +100"
-            ),
-            "dehaze" to Schema.integer(
-                description = "Estimated Lightroom Dehaze from -100 to +100"
-            ),
-            "vignette" to Schema.integer(
-                description = "Estimated Post-Crop Vignette amount from -100 (dark edges) to +100 (bright edges)"
-            ),
-            "grain" to Schema.integer(
-                description = "Estimated film Grain amount from 0 to 100"
-            )
-        )
-    )
-
-    private val model by lazy {
-        Firebase.ai.generativeModel(
-            modelName = "gemini-3.8-flash",
-            generationConfig = generationConfig {
-                temperature = 0.2f
-                responseMimeType = "application/json"
-                responseSchema = colorGradingSchema
-            }
-        )
-    }
+class ColorGradingAnalyzer(
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
+) {
 
     suspend fun analyzeImage(bitmap: Bitmap): ColorGradingProfile {
+        val apiKey = BuildConfig.GEMINI_API_KEY
+        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
+            Log.e(TAG, "GEMINI_API_KEY is missing or unconfigured.")
+            throw IllegalStateException(
+                "Gemini API key is missing. Add GEMINI_API_KEY in the AI Studio Secrets panel."
+            )
+        }
+
+        return try {
+            withTimeout(60_000L) {
+                val base64Jpeg = withContext(Dispatchers.Default) {
+                    encodeBitmapToBase64Jpeg(bitmap)
+                }
+                val requestJson = buildRequestPayload(base64Jpeg)
+                val responseBody = withContext(Dispatchers.IO) {
+                    executeGenerateContentRequest(apiKey, requestJson)
+                }
+                val generatedJsonText = extractGeneratedText(responseBody)
+                parseProfile(generatedJsonText)
+            }
+        } catch (e: TimeoutCancellationException) {
+            Log.e(TAG, "Color grading analysis timed out after 60s", e)
+            throw e
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Color grading analysis failed", e)
+            throw e
+        }
+    }
+
+    private fun encodeBitmapToBase64Jpeg(bitmap: Bitmap): String {
+        val stream = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 88, stream)
+        return Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+    }
+
+    private fun executeGenerateContentRequest(apiKey: String, requestJson: String): String {
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val request = Request.Builder()
+            .url(GEMINI_ENDPOINT)
+            .addHeader("Content-Type", "application/json")
+            .addHeader("x-goog-api-key", apiKey)
+            .post(requestJson.toRequestBody(mediaType))
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            val bodyString = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                val apiError = extractApiErrorMessage(bodyString)
+                throw IllegalStateException(
+                    apiError ?: "Gemini API request failed (HTTP ${response.code})."
+                )
+            }
+            if (bodyString.isBlank()) {
+                throw IllegalStateException("Gemini API returned an empty response body.")
+            }
+            return bodyString
+        }
+    }
+
+    internal fun buildRequestPayload(base64Jpeg: String): String {
         val prompt = """
             You are a master digital colorist and Adobe Lightroom preset engineer.
             Carefully inspect this reference photograph's luminance distribution, black/white points,
@@ -120,30 +109,115 @@ class ColorGradingAnalyzer {
             in degrees where 0=red, 35=amber/orange, 180=cyan, 210=teal/blue).
         """.trimIndent()
 
-        return try {
-            val response = withTimeout(60_000L) {
-                model.generateContent(
-                    content {
-                        image(bitmap)
-                        text(prompt)
-                    }
-                )
-            }
-            val jsonText = response.text
-                ?: throw IllegalStateException("Gemini returned an empty response.")
-            parseProfile(jsonText)
-        } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "Color grading analysis timed out after 60s", e)
-            throw e
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Log.e(TAG, "Color grading analysis failed", e)
-            throw e
+        val inlineData = JSONObject().apply {
+            put("mime_type", "image/jpeg")
+            put("data", base64Jpeg)
+        }
+        val imagePart = JSONObject().put("inline_data", inlineData)
+        val textPart = JSONObject().put("text", prompt)
+        val parts = JSONArray().apply {
+            put(imagePart)
+            put(textPart)
+        }
+        val content = JSONObject().apply {
+            put("role", "user")
+            put("parts", parts)
+        }
+
+        val generationConfig = JSONObject().apply {
+            put("temperature", 0.2)
+            put("responseMimeType", "application/json")
+            put("responseSchema", buildResponseSchema())
+        }
+
+        return JSONObject().apply {
+            put("contents", JSONArray().put(content))
+            put("generationConfig", generationConfig)
+        }.toString()
+    }
+
+    private fun buildResponseSchema(): JSONObject {
+        val properties = JSONObject().apply {
+            put("presetName", schemaProp("STRING", "Short 2 to 4 word Lightroom preset name"))
+            put("moodSummary", schemaProp("STRING", "Concise mood summary, e.g. 'Warm Teal & Orange Cinematic'"))
+            put("moodNotes", schemaProp("STRING", "One-sentence colorist note explaining the look"))
+            put("exposure", schemaProp("NUMBER", "Lightroom Exposure2012 in EV from -3.0 to +3.0"))
+            put("contrast", schemaProp("INTEGER", "Lightroom Contrast2012 from -100 to +100"))
+            put("highlights", schemaProp("INTEGER", "Lightroom Highlights2012 from -100 to +100"))
+            put("shadows", schemaProp("INTEGER", "Lightroom Shadows2012 from -100 to +100"))
+            put("whites", schemaProp("INTEGER", "Lightroom Whites2012 from -100 to +100"))
+            put("blacks", schemaProp("INTEGER", "Lightroom Blacks2012 from -100 to +100"))
+            put("temperature", schemaProp("INTEGER", "Color Temperature in Kelvin from 2500 to 10000"))
+            put("tint", schemaProp("INTEGER", "Green-magenta Tint from -150 to +150"))
+            put("vibrance", schemaProp("INTEGER", "Lightroom Vibrance from -100 to +100"))
+            put("saturation", schemaProp("INTEGER", "Lightroom Saturation from -100 to +100"))
+            put("highlightsHue", schemaProp("INTEGER", "3-Way Highlights Hue angle 0 to 360"))
+            put("highlightsSaturation", schemaProp("INTEGER", "3-Way Highlights Saturation 0 to 100"))
+            put("midtonesHue", schemaProp("INTEGER", "3-Way Midtones Hue angle 0 to 360"))
+            put("midtonesSaturation", schemaProp("INTEGER", "3-Way Midtones Saturation 0 to 100"))
+            put("shadowsHue", schemaProp("INTEGER", "3-Way Shadows Hue angle 0 to 360"))
+            put("shadowsSaturation", schemaProp("INTEGER", "3-Way Shadows Saturation 0 to 100"))
+            put("texture", schemaProp("INTEGER", "Lightroom Texture from -100 to +100"))
+            put("clarity", schemaProp("INTEGER", "Lightroom Clarity2012 from -100 to +100"))
+            put("dehaze", schemaProp("INTEGER", "Lightroom Dehaze from -100 to +100"))
+            put("vignette", schemaProp("INTEGER", "Post-Crop Vignette amount from -100 to +100"))
+            put("grain", schemaProp("INTEGER", "Film Grain amount from 0 to 100"))
+        }
+
+        val required = JSONArray(
+            listOf(
+                "presetName", "moodSummary", "moodNotes",
+                "exposure", "contrast", "highlights", "shadows", "whites", "blacks",
+                "temperature", "tint", "vibrance", "saturation",
+                "highlightsHue", "highlightsSaturation",
+                "midtonesHue", "midtonesSaturation",
+                "shadowsHue", "shadowsSaturation",
+                "texture", "clarity", "dehaze", "vignette", "grain"
+            )
+        )
+
+        return JSONObject().apply {
+            put("type", "OBJECT")
+            put("properties", properties)
+            put("required", required)
         }
     }
 
-    private fun parseProfile(jsonText: String): ColorGradingProfile {
+    private fun schemaProp(type: String, description: String): JSONObject =
+        JSONObject().apply {
+            put("type", type)
+            put("description", description)
+        }
+
+    internal fun extractGeneratedText(responseBody: String): String {
+        val root = JSONObject(responseBody)
+        val candidates = root.optJSONArray("candidates")
+            ?: throw IllegalStateException("Gemini returned no candidates.")
+        if (candidates.length() == 0) {
+            throw IllegalStateException("Gemini returned an empty candidates list.")
+        }
+        val content = candidates.getJSONObject(0).optJSONObject("content")
+            ?: throw IllegalStateException("Gemini candidate missing content.")
+        val parts = content.optJSONArray("parts")
+            ?: throw IllegalStateException("Gemini candidate missing parts.")
+        val text = (0 until parts.length())
+            .mapNotNull { idx -> parts.getJSONObject(idx).optString("text", "") }
+            .firstOrNull { it.isNotBlank() }
+            ?: throw IllegalStateException("Gemini returned no text output.")
+        return text
+    }
+
+    internal fun extractApiErrorMessage(errorBody: String): String? {
+        if (errorBody.isBlank()) return null
+        return try {
+            val json = JSONObject(errorBody)
+            json.optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    internal fun parseProfile(jsonText: String): ColorGradingProfile {
         val json = JSONObject(jsonText)
         return ColorGradingProfile(
             presetName = json.optString("presetName", "GradeScan Look").ifBlank { "GradeScan Look" },
