@@ -121,4 +121,94 @@ class ColorGradingAnalyzerTest {
         }
         assertEquals("API key not valid.", thrown?.message)
     }
+
+    @Test
+    fun `interactions create serializes exact expected v1beta URL headers and JSON body`() {
+        val server = java.net.ServerSocket(0)
+        val port = server.localPort
+        var capturedRequest = ""
+        val serverThread = Thread {
+            server.use { srv ->
+                srv.accept().use { socket ->
+                    val input = socket.getInputStream()
+                    val reader = java.io.BufferedReader(java.io.InputStreamReader(input))
+                    val sb = StringBuilder()
+                    var contentLength = 0
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        sb.append(line).append("\n")
+                        if (line.lowercase().startsWith("content-length:")) {
+                            contentLength = line.substringAfter(":").trim().toInt()
+                        }
+                        if (line.isEmpty()) break
+                    }
+                    val bodyChars = CharArray(contentLength)
+                    var read = 0
+                    while (read < contentLength) {
+                        val r = reader.read(bodyChars, read, contentLength - read)
+                        if (r <= 0) break
+                        read += r
+                    }
+                    sb.append(String(bodyChars, 0, read))
+                    capturedRequest = sb.toString()
+
+                    val responseJson = """{"id":"int_1","status":"completed","outputs":[{"type":"text","text":"{}"}]}"""
+                    val httpResp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${responseJson.toByteArray().size}\r\nConnection: close\r\n\r\n$responseJson"
+                    socket.getOutputStream().write(httpResp.toByteArray())
+                    socket.getOutputStream().flush()
+                }
+            }
+        }
+        serverThread.start()
+
+        val client = Client.builder()
+            .apiKey("test-api-key")
+            .vertexAI(false)
+            .httpOptions(
+                com.google.genai.types.HttpOptions.builder()
+                    .baseUrl("http://127.0.0.1:$port")
+                    .apiVersion("v1beta")
+                    .build()
+            )
+            .build()
+        val requestModel = analyzer.buildModelInteraction("ZmFrZUJhc2U2NA==")
+        client.interactions.create(
+            com.google.genai.gaos.models.operations.CreateInteractionRequestBody.of(requestModel)
+        )
+        serverThread.join(5000)
+        client.close()
+
+        assertTrue(capturedRequest.startsWith("POST /v1beta/interactions HTTP/1.1"))
+        assertTrue(capturedRequest.contains("\"model\":\"gemini-3.8-flash\""))
+        assertTrue(!capturedRequest.contains("models/"))
+        assertTrue(!capturedRequest.contains("\"response_mime_type\""))
+        assertTrue(!capturedRequest.contains("\"generation_config\""))
+        assertTrue(!capturedRequest.contains("\"store\""))
+        assertTrue(capturedRequest.contains("\"response_format\":{"))
+    }
+
+    @Test
+    fun `formatApiExceptionDetails and buildUserFacingErrorMessage expose full 400 error body`() {
+        val errorBody = """{"error":{"code":"invalid_request","message":"Invalid schema field"}}"""
+        val httpRequest = com.google.genai.gaos.utils.transport.HttpRequest.builder()
+            .method("POST")
+            .uri(java.net.URI.create("https://generativelanguage.googleapis.com/v1beta/interactions"))
+            .build()
+        val bodyStream: java.io.InputStream = java.io.ByteArrayInputStream(errorBody.toByteArray())
+        val httpResponse = com.google.genai.gaos.utils.transport.HttpResponse<java.io.InputStream>(
+            httpRequest,
+            400,
+            com.google.genai.gaos.utils.Headers.EMPTY,
+            bodyStream
+        )
+        val clientError = com.google.genai.gaos.models.errors.CreateInteractionClientError.from(httpResponse)
+
+        val formatted = analyzer.formatApiExceptionDetails(clientError)
+        val userMessage = analyzer.buildUserFacingErrorMessage(clientError)
+
+        assertTrue(formatted.contains("HTTP 400"))
+        assertTrue(formatted.contains("Invalid schema field"))
+        assertTrue(formatted.contains(errorBody))
+        assertEquals("Gemini API error (HTTP 400): Invalid schema field", userMessage)
+    }
 }

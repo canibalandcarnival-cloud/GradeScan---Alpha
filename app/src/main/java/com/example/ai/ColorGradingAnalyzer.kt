@@ -6,6 +6,11 @@ import android.util.Log
 import com.example.BuildConfig
 import com.example.model.ColorGradingProfile
 import com.google.genai.Client
+import com.google.genai.errors.ApiException
+import com.google.genai.gaos.models.errors.CreateInteractionClientError
+import com.google.genai.gaos.models.errors.GaosBaseException
+import com.google.genai.gaos.models.errors.GaosClientException
+import com.google.genai.gaos.models.errors.GaosServerException
 import com.google.genai.gaos.models.interactions.CreateModelInteraction
 import com.google.genai.gaos.models.interactions.CreateModelInteractionResponseFormat
 import com.google.genai.gaos.models.interactions.ImageContent
@@ -19,6 +24,7 @@ import com.google.genai.gaos.models.interactions.TextContent
 import com.google.genai.gaos.models.interactions.TextResponseFormat
 import com.google.genai.gaos.models.interactions.TextResponseFormatMimeType
 import com.google.genai.gaos.models.operations.CreateInteractionRequestBody
+import com.google.genai.types.HttpOptions
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
@@ -35,6 +41,11 @@ class ColorGradingAnalyzer(
         Client.builder()
             .apiKey(apiKey)
             .vertexAI(false)
+            .httpOptions(
+                HttpOptions.builder()
+                    .apiVersion("v1beta")
+                    .build()
+            )
             .build()
     }
 ) {
@@ -42,7 +53,9 @@ class ColorGradingAnalyzer(
     private val client: Client by lazy {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
-            Log.e(TAG, "GEMINI_API_KEY is missing or unconfigured.")
+            val missingMsg = "GEMINI_API_KEY is missing or unconfigured."
+            Log.e(TAG, missingMsg)
+            println("$TAG ERROR: $missingMsg")
             throw IllegalStateException(
                 "Gemini API key is missing. Add GEMINI_API_KEY in the AI Studio Secrets panel."
             )
@@ -57,6 +70,9 @@ class ColorGradingAnalyzer(
                     encodeBitmapToBase64Jpeg(bitmap)
                 }
                 val requestModel = buildModelInteraction(base64Jpeg)
+                val modelId = requestModel.model().map { it.value() }.orElse("unknown")
+                Log.d(TAG, "Sending Interactions API request (model=$modelId, apiVersion=v1beta)")
+
                 val response = withContext(Dispatchers.IO) {
                     client.interactions.create(
                         CreateInteractionRequestBody.of(requestModel)
@@ -72,13 +88,83 @@ class ColorGradingAnalyzer(
             }
         } catch (e: TimeoutCancellationException) {
             Log.e(TAG, "Color grading analysis timed out after 60s", e)
+            println("$TAG ERROR: Color grading analysis timed out after 60s")
             throw e
         } catch (e: CancellationException) {
             throw e
+        } catch (e: GaosClientException) {
+            val formatted = formatApiExceptionDetails(e)
+            Log.e(TAG, formatted, e)
+            println("$TAG ERROR:\n$formatted")
+            throw IllegalStateException(buildUserFacingErrorMessage(e), e)
+        } catch (e: GaosServerException) {
+            val formatted = formatApiExceptionDetails(e)
+            Log.e(TAG, formatted, e)
+            println("$TAG ERROR:\n$formatted")
+            throw IllegalStateException(buildUserFacingErrorMessage(e), e)
+        } catch (e: GaosBaseException) {
+            val formatted = formatApiExceptionDetails(e)
+            Log.e(TAG, formatted, e)
+            println("$TAG ERROR:\n$formatted")
+            throw IllegalStateException(buildUserFacingErrorMessage(e), e)
+        } catch (e: ApiException) {
+            val details = "Gemini API error (HTTP ${e.code()}, status=${e.status()}): ${e.message()}"
+            Log.e(TAG, details, e)
+            println("$TAG ERROR: $details")
+            throw IllegalStateException(details, e)
         } catch (e: Exception) {
-            Log.e(TAG, "Color grading analysis failed", e)
+            Log.e(TAG, "Color grading analysis failed: ${e.message}", e)
+            println("$TAG ERROR: Color grading analysis failed: ${e.message}")
             throw e
         }
+    }
+
+    internal fun formatApiExceptionDetails(e: ApiException): String {
+        val statusCode = e.code()
+        val requestUri = when (e) {
+            is GaosClientException -> runCatching { e.rawResponse().request().uri().toString() }.getOrNull()
+            is GaosServerException -> runCatching { e.rawResponse().request().uri().toString() }.getOrNull()
+            is GaosBaseException -> runCatching { e.rawResponse().request().uri().toString() }.getOrNull()
+            else -> null
+        }
+        val rawBody = when (e) {
+            is GaosClientException -> e.bodyAsString().orElse("").trim()
+            is GaosServerException -> e.bodyAsString().orElse("").trim()
+            is GaosBaseException -> e.bodyAsString().orElse("").trim()
+            else -> ""
+        }
+        val structuredError = (e as? CreateInteractionClientError)
+            ?.data()
+            ?.flatMap { it.error() }
+            ?.orElse(null)
+        val errorCode = structuredError?.code()?.orElse(null)
+        val errorMessage = structuredError?.message()?.orElse(null)
+
+        return buildString {
+            append("Gemini Interactions API error (HTTP $statusCode)")
+            if (!requestUri.isNullOrBlank()) append(" uri=$requestUri")
+            if (!errorCode.isNullOrBlank()) append(" code=$errorCode")
+            if (!errorMessage.isNullOrBlank()) append(" message=$errorMessage")
+            append("\nFull error body: ${rawBody.ifBlank { e.message() ?: "<empty>" }}")
+        }
+    }
+
+    internal fun buildUserFacingErrorMessage(e: ApiException): String {
+        val statusCode = e.code()
+        val structuredMessage = (e as? CreateInteractionClientError)
+            ?.data()
+            ?.flatMap { it.error() }
+            ?.flatMap { it.message() }
+            ?.orElse(null)
+            ?.takeIf { it.isNotBlank() }
+        val rawBody = when (e) {
+            is GaosClientException -> e.bodyAsString().orElse("").trim()
+            is GaosServerException -> e.bodyAsString().orElse("").trim()
+            is GaosBaseException -> e.bodyAsString().orElse("").trim()
+            else -> ""
+        }
+        val detail = structuredMessage ?: rawBody.ifBlank { e.message() }
+        return "Gemini API error (HTTP $statusCode): $detail"
     }
 
     private fun encodeBitmapToBase64Jpeg(bitmap: Bitmap): String {
@@ -122,7 +208,6 @@ class ColorGradingAnalyzer(
                     ResponseFormat.of(textResponseFormat)
                 )
             )
-            .store(false)
             .build()
     }
 
