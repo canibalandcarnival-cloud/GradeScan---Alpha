@@ -5,35 +5,41 @@ import android.util.Base64
 import android.util.Log
 import com.example.BuildConfig
 import com.example.model.ColorGradingProfile
+import com.google.genai.Client
+import com.google.genai.gaos.models.interactions.CreateModelInteraction
+import com.google.genai.gaos.models.interactions.CreateModelInteractionResponseFormat
+import com.google.genai.gaos.models.interactions.ImageContent
+import com.google.genai.gaos.models.interactions.ImageContentMimeType
+import com.google.genai.gaos.models.interactions.Interaction
+import com.google.genai.gaos.models.interactions.InteractionStatus
+import com.google.genai.gaos.models.interactions.InteractionsInput
+import com.google.genai.gaos.models.interactions.Model
+import com.google.genai.gaos.models.interactions.ResponseFormat
+import com.google.genai.gaos.models.interactions.TextContent
+import com.google.genai.gaos.models.interactions.TextResponseFormat
+import com.google.genai.gaos.models.interactions.TextResponseFormatMimeType
+import com.google.genai.gaos.models.operations.CreateInteractionRequestBody
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 private const val TAG = "ColorGradingAnalyzer"
-private const val GEMINI_MODEL_ID = "gemini-2.5-flash"
-private const val GEMINI_ENDPOINT =
-    "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL_ID:generateContent"
 
 class ColorGradingAnalyzer(
-    private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
+    private val clientFactory: (String) -> Client = { apiKey ->
+        Client.builder()
+            .apiKey(apiKey)
+            .vertexAI(false)
+            .build()
+    }
 ) {
 
-    suspend fun analyzeImage(bitmap: Bitmap): ColorGradingProfile {
+    private val client: Client by lazy {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
             Log.e(TAG, "GEMINI_API_KEY is missing or unconfigured.")
@@ -41,17 +47,27 @@ class ColorGradingAnalyzer(
                 "Gemini API key is missing. Add GEMINI_API_KEY in the AI Studio Secrets panel."
             )
         }
+        clientFactory(apiKey)
+    }
 
+    suspend fun analyzeImage(bitmap: Bitmap): ColorGradingProfile {
         return try {
             withTimeout(60_000L) {
                 val base64Jpeg = withContext(Dispatchers.Default) {
                     encodeBitmapToBase64Jpeg(bitmap)
                 }
-                val requestJson = buildRequestPayload(base64Jpeg)
-                val responseBody = withContext(Dispatchers.IO) {
-                    executeGenerateContentRequest(apiKey, requestJson)
+                val requestModel = buildModelInteraction(base64Jpeg)
+                val response = withContext(Dispatchers.IO) {
+                    client.interactions.create(
+                        CreateInteractionRequestBody.of(requestModel)
+                    )
                 }
-                val generatedJsonText = extractGeneratedText(responseBody)
+                val interaction = response.interaction().orElseThrow {
+                    IllegalStateException(
+                        "Gemini Interactions API returned no interaction (HTTP ${response.statusCode()})."
+                    )
+                }
+                val generatedJsonText = extractInteractionOutputText(interaction)
                 parseProfile(generatedJsonText)
             }
         } catch (e: TimeoutCancellationException) {
@@ -71,31 +87,7 @@ class ColorGradingAnalyzer(
         return Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
     }
 
-    private fun executeGenerateContentRequest(apiKey: String, requestJson: String): String {
-        val mediaType = "application/json; charset=utf-8".toMediaType()
-        val request = Request.Builder()
-            .url(GEMINI_ENDPOINT)
-            .addHeader("Content-Type", "application/json")
-            .addHeader("x-goog-api-key", apiKey)
-            .post(requestJson.toRequestBody(mediaType))
-            .build()
-
-        httpClient.newCall(request).execute().use { response ->
-            val bodyString = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                val apiError = extractApiErrorMessage(bodyString)
-                throw IllegalStateException(
-                    apiError ?: "Gemini API request failed (HTTP ${response.code})."
-                )
-            }
-            if (bodyString.isBlank()) {
-                throw IllegalStateException("Gemini API returned an empty response body.")
-            }
-            return bodyString
-        }
-    }
-
-    internal fun buildRequestPayload(base64Jpeg: String): String {
+    internal fun buildModelInteraction(base64Jpeg: String): CreateModelInteraction {
         val prompt = """
             You are a master digital colorist and Adobe Lightroom preset engineer.
             Carefully inspect this reference photograph's luminance distribution, black/white points,
@@ -109,112 +101,88 @@ class ColorGradingAnalyzer(
             in degrees where 0=red, 35=amber/orange, 180=cyan, 210=teal/blue).
         """.trimIndent()
 
-        val inlineData = JSONObject().apply {
-            put("mime_type", "image/jpeg")
-            put("data", base64Jpeg)
-        }
-        val imagePart = JSONObject().put("inline_data", inlineData)
-        val textPart = JSONObject().put("text", prompt)
-        val parts = JSONArray().apply {
-            put(imagePart)
-            put(textPart)
-        }
-        val content = JSONObject().apply {
-            put("role", "user")
-            put("parts", parts)
-        }
+        val imageContent = ImageContent.builder()
+            .data(base64Jpeg)
+            .mimeType(ImageContentMimeType.IMAGE_JPEG)
+            .build()
+        val textContent = TextContent.builder()
+            .text(prompt)
+            .build()
 
-        val generationConfig = JSONObject().apply {
-            put("temperature", 0.2)
-            put("responseMimeType", "application/json")
-            put("responseSchema", buildResponseSchema())
-        }
+        val textResponseFormat = TextResponseFormat.builder()
+            .mimeType(TextResponseFormatMimeType.APPLICATION_JSON)
+            .schema(buildResponseSchemaMap())
+            .build()
 
-        return JSONObject().apply {
-            put("contents", JSONArray().put(content))
-            put("generationConfig", generationConfig)
-        }.toString()
+        return CreateModelInteraction.builder()
+            .model(Model.GEMINI38_FLASH)
+            .input(InteractionsInput.ofContent(listOf(imageContent, textContent)))
+            .responseFormat(
+                CreateModelInteractionResponseFormat.of(
+                    ResponseFormat.of(textResponseFormat)
+                )
+            )
+            .store(false)
+            .build()
     }
 
-    private fun buildResponseSchema(): JSONObject {
-        val properties = JSONObject().apply {
-            put("presetName", schemaProp("STRING", "Short 2 to 4 word Lightroom preset name"))
-            put("moodSummary", schemaProp("STRING", "Concise mood summary, e.g. 'Warm Teal & Orange Cinematic'"))
-            put("moodNotes", schemaProp("STRING", "One-sentence colorist note explaining the look"))
-            put("exposure", schemaProp("NUMBER", "Lightroom Exposure2012 in EV from -3.0 to +3.0"))
-            put("contrast", schemaProp("INTEGER", "Lightroom Contrast2012 from -100 to +100"))
-            put("highlights", schemaProp("INTEGER", "Lightroom Highlights2012 from -100 to +100"))
-            put("shadows", schemaProp("INTEGER", "Lightroom Shadows2012 from -100 to +100"))
-            put("whites", schemaProp("INTEGER", "Lightroom Whites2012 from -100 to +100"))
-            put("blacks", schemaProp("INTEGER", "Lightroom Blacks2012 from -100 to +100"))
-            put("temperature", schemaProp("INTEGER", "Color Temperature in Kelvin from 2500 to 10000"))
-            put("tint", schemaProp("INTEGER", "Green-magenta Tint from -150 to +150"))
-            put("vibrance", schemaProp("INTEGER", "Lightroom Vibrance from -100 to +100"))
-            put("saturation", schemaProp("INTEGER", "Lightroom Saturation from -100 to +100"))
-            put("highlightsHue", schemaProp("INTEGER", "3-Way Highlights Hue angle 0 to 360"))
-            put("highlightsSaturation", schemaProp("INTEGER", "3-Way Highlights Saturation 0 to 100"))
-            put("midtonesHue", schemaProp("INTEGER", "3-Way Midtones Hue angle 0 to 360"))
-            put("midtonesSaturation", schemaProp("INTEGER", "3-Way Midtones Saturation 0 to 100"))
-            put("shadowsHue", schemaProp("INTEGER", "3-Way Shadows Hue angle 0 to 360"))
-            put("shadowsSaturation", schemaProp("INTEGER", "3-Way Shadows Saturation 0 to 100"))
-            put("texture", schemaProp("INTEGER", "Lightroom Texture from -100 to +100"))
-            put("clarity", schemaProp("INTEGER", "Lightroom Clarity2012 from -100 to +100"))
-            put("dehaze", schemaProp("INTEGER", "Lightroom Dehaze from -100 to +100"))
-            put("vignette", schemaProp("INTEGER", "Post-Crop Vignette amount from -100 to +100"))
-            put("grain", schemaProp("INTEGER", "Film Grain amount from 0 to 100"))
-        }
-
-        val required = JSONArray(
-            listOf(
-                "presetName", "moodSummary", "moodNotes",
-                "exposure", "contrast", "highlights", "shadows", "whites", "blacks",
-                "temperature", "tint", "vibrance", "saturation",
-                "highlightsHue", "highlightsSaturation",
-                "midtonesHue", "midtonesSaturation",
-                "shadowsHue", "shadowsSaturation",
-                "texture", "clarity", "dehaze", "vignette", "grain"
-            )
+    internal fun buildResponseSchemaMap(): Map<String, Any> {
+        val properties = mapOf(
+            "presetName" to schemaProp("string", "Short 2 to 4 word Lightroom preset name"),
+            "moodSummary" to schemaProp("string", "Concise mood summary, e.g. 'Warm Teal & Orange Cinematic'"),
+            "moodNotes" to schemaProp("string", "One-sentence colorist note explaining the look"),
+            "exposure" to schemaProp("number", "Lightroom Exposure2012 in EV from -3.0 to +3.0"),
+            "contrast" to schemaProp("integer", "Lightroom Contrast2012 from -100 to +100"),
+            "highlights" to schemaProp("integer", "Lightroom Highlights2012 from -100 to +100"),
+            "shadows" to schemaProp("integer", "Lightroom Shadows2012 from -100 to +100"),
+            "whites" to schemaProp("integer", "Lightroom Whites2012 from -100 to +100"),
+            "blacks" to schemaProp("integer", "Lightroom Blacks2012 from -100 to +100"),
+            "temperature" to schemaProp("integer", "Color Temperature in Kelvin from 2500 to 10000"),
+            "tint" to schemaProp("integer", "Green-magenta Tint from -150 to +150"),
+            "vibrance" to schemaProp("integer", "Lightroom Vibrance from -100 to +100"),
+            "saturation" to schemaProp("integer", "Lightroom Saturation from -100 to +100"),
+            "highlightsHue" to schemaProp("integer", "3-Way Highlights Hue angle 0 to 360"),
+            "highlightsSaturation" to schemaProp("integer", "3-Way Highlights Saturation 0 to 100"),
+            "midtonesHue" to schemaProp("integer", "3-Way Midtones Hue angle 0 to 360"),
+            "midtonesSaturation" to schemaProp("integer", "3-Way Midtones Saturation 0 to 100"),
+            "shadowsHue" to schemaProp("integer", "3-Way Shadows Hue angle 0 to 360"),
+            "shadowsSaturation" to schemaProp("integer", "3-Way Shadows Saturation 0 to 100"),
+            "texture" to schemaProp("integer", "Lightroom Texture from -100 to +100"),
+            "clarity" to schemaProp("integer", "Lightroom Clarity2012 from -100 to +100"),
+            "dehaze" to schemaProp("integer", "Lightroom Dehaze from -100 to +100"),
+            "vignette" to schemaProp("integer", "Post-Crop Vignette amount from -100 to +100"),
+            "grain" to schemaProp("integer", "Film Grain amount from 0 to 100")
         )
 
-        return JSONObject().apply {
-            put("type", "OBJECT")
-            put("properties", properties)
-            put("required", required)
-        }
+        return mapOf(
+            "type" to "object",
+            "properties" to properties,
+            "required" to properties.keys.toList()
+        )
     }
 
-    private fun schemaProp(type: String, description: String): JSONObject =
-        JSONObject().apply {
-            put("type", type)
-            put("description", description)
+    private fun schemaProp(type: String, description: String): Map<String, Any> = mapOf(
+        "type" to type,
+        "description" to description
+    )
+
+    internal fun extractInteractionOutputText(interaction: Interaction): String {
+        val status = interaction.status().orElse(null)
+        if (status == InteractionStatus.FAILED || status == InteractionStatus.CANCELLED) {
+            val errorMsg = interaction.errors()
+                .orElse(emptyList())
+                .mapNotNull { it.message().orElse(null) }
+                .firstOrNull { it.isNotBlank() }
+            throw IllegalStateException(
+                errorMsg ?: "Gemini interaction ended with status: ${status.value()}"
+            )
         }
 
-    internal fun extractGeneratedText(responseBody: String): String {
-        val root = JSONObject(responseBody)
-        val candidates = root.optJSONArray("candidates")
-            ?: throw IllegalStateException("Gemini returned no candidates.")
-        if (candidates.length() == 0) {
-            throw IllegalStateException("Gemini returned an empty candidates list.")
+        val text = interaction.outputText().orElse("")
+        if (text.isBlank()) {
+            throw IllegalStateException("Gemini Interactions API returned empty output text.")
         }
-        val content = candidates.getJSONObject(0).optJSONObject("content")
-            ?: throw IllegalStateException("Gemini candidate missing content.")
-        val parts = content.optJSONArray("parts")
-            ?: throw IllegalStateException("Gemini candidate missing parts.")
-        val text = (0 until parts.length())
-            .mapNotNull { idx -> parts.getJSONObject(idx).optString("text", "") }
-            .firstOrNull { it.isNotBlank() }
-            ?: throw IllegalStateException("Gemini returned no text output.")
         return text
-    }
-
-    internal fun extractApiErrorMessage(errorBody: String): String? {
-        if (errorBody.isBlank()) return null
-        return try {
-            val json = JSONObject(errorBody)
-            json.optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
-        } catch (_: Exception) {
-            null
-        }
     }
 
     internal fun parseProfile(jsonText: String): ColorGradingProfile {

@@ -1,8 +1,15 @@
 package com.example
 
 import com.example.ai.ColorGradingAnalyzer
-import org.json.JSONObject
+import com.google.genai.Client
+import com.google.genai.gaos.models.interactions.Error
+import com.google.genai.gaos.models.interactions.ImageContent
+import com.google.genai.gaos.models.interactions.Interaction
+import com.google.genai.gaos.models.interactions.InteractionStatus
+import com.google.genai.gaos.models.interactions.Model
+import com.google.genai.gaos.models.interactions.TextResponseFormatMimeType
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -16,28 +23,44 @@ class ColorGradingAnalyzerTest {
     private val analyzer = ColorGradingAnalyzer()
 
     @Test
-    fun `buildRequestPayload includes image inline_data and structured JSON schema`() {
-        val payload = analyzer.buildRequestPayload("ZmFrZUJhc2U2NA==")
-        val root = JSONObject(payload)
-
-        val parts = root.getJSONArray("contents")
-            .getJSONObject(0)
-            .getJSONArray("parts")
-        assertEquals(2, parts.length())
-        assertEquals("image/jpeg", parts.getJSONObject(0).getJSONObject("inline_data").getString("mime_type"))
-        assertEquals("ZmFrZUJhc2U2NA==", parts.getJSONObject(0).getJSONObject("inline_data").getString("data"))
-
-        val genConfig = root.getJSONObject("generationConfig")
-        assertEquals("application/json", genConfig.getString("responseMimeType"))
-        val schema = genConfig.getJSONObject("responseSchema")
-        assertEquals("OBJECT", schema.getString("type"))
-        assertTrue(schema.getJSONObject("properties").has("exposure"))
-        assertTrue(schema.getJSONObject("properties").has("highlightsHue"))
-        assertTrue(schema.getJSONObject("properties").has("grain"))
+    fun `google-genai Client builds cleanly for Gemini Developer API`() {
+        val client = Client.builder()
+            .apiKey("test-api-key")
+            .vertexAI(false)
+            .build()
+        assertNotNull(client.interactions)
+        client.close()
     }
 
     @Test
-    fun `extractGeneratedText and parseProfile decode standard Gemini API response`() {
+    fun `buildModelInteraction targets gemini-3_8-flash with multimodal image and JSON schema`() {
+        val request = analyzer.buildModelInteraction("ZmFrZUJhc2U2NA==")
+
+        assertEquals(Model.GEMINI38_FLASH, request.model().orElse(null))
+
+        val contents = request.input().orElseThrow().arrayOfContent().orElseThrow()
+        assertEquals(2, contents.size)
+        val imageContent = contents[0] as ImageContent
+        assertEquals("ZmFrZUJhc2U2NA==", imageContent.data().orElse(null))
+
+        val textResponseFormat = request.responseFormat()
+            .orElseThrow()
+            .responseFormat()
+            .orElseThrow()
+            .textResponseFormat()
+            .orElseThrow()
+        assertEquals(TextResponseFormatMimeType.APPLICATION_JSON, textResponseFormat.mimeType().orElse(null))
+        val schema = textResponseFormat.schema().orElseThrow()
+        assertEquals("object", schema["type"])
+        @Suppress("UNCHECKED_CAST")
+        val props = schema["properties"] as Map<String, Any>
+        assertTrue(props.containsKey("exposure"))
+        assertTrue(props.containsKey("highlightsHue"))
+        assertTrue(props.containsKey("grain"))
+    }
+
+    @Test
+    fun `extractInteractionOutputText and parseProfile decode Interactions response`() {
         val innerJson = """
             {
               "presetName": "Amber Noir",
@@ -67,20 +90,12 @@ class ColorGradingAnalyzerTest {
             }
         """.trimIndent()
 
-        val apiResponse = JSONObject().put(
-            "candidates",
-            org.json.JSONArray().put(
-                JSONObject().put(
-                    "content",
-                    JSONObject().put(
-                        "parts",
-                        org.json.JSONArray().put(JSONObject().put("text", innerJson))
-                    )
-                )
-            )
-        ).toString()
+        val interaction = Interaction.builder()
+            .status(InteractionStatus.COMPLETED)
+            .outputText(innerJson)
+            .build()
 
-        val extracted = analyzer.extractGeneratedText(apiResponse)
+        val extracted = analyzer.extractInteractionOutputText(interaction)
         val profile = analyzer.parseProfile(extracted)
 
         assertEquals("Amber Noir", profile.presetName)
@@ -92,8 +107,18 @@ class ColorGradingAnalyzerTest {
     }
 
     @Test
-    fun `extractApiErrorMessage parses standard Gemini error envelope`() {
-        val errorJson = """{"error":{"code":400,"message":"API key not valid."}}"""
-        assertEquals("API key not valid.", analyzer.extractApiErrorMessage(errorJson))
+    fun `extractInteractionOutputText surfaces error message when interaction fails`() {
+        val failedInteraction = Interaction.builder()
+            .status(InteractionStatus.FAILED)
+            .errors(listOf(Error.builder().message("API key not valid.").build()))
+            .build()
+
+        var thrown: IllegalStateException? = null
+        try {
+            analyzer.extractInteractionOutputText(failedInteraction)
+        } catch (e: IllegalStateException) {
+            thrown = e
+        }
+        assertEquals("API key not valid.", thrown?.message)
     }
 }
